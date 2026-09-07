@@ -1,6 +1,6 @@
 # Prompt Injection Detection for Email Agents Through Attack Chain Modeling
 
-This repo contains the code for the email project paper under review.
+This repository contains the code accompanying the paper "Prompt Injection Detection for Email Agents Through Attack Chain Modeling," accepted at IEEE ICTAI 2026.
 
 ## Folder Layout
 
