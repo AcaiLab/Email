@@ -37,30 +37,31 @@ def vectorizer_for(mode: str, max_features: int) -> TfidfVectorizer:
     raise ValueError(f"Unsupported mode: {mode}")
 
 
-def fit_sgd(x_train, y_train) -> SGDClassifier:
+def fit_sgd(x_train, y_train, random_state: int = SEED) -> SGDClassifier:
     model = SGDClassifier(
         loss="log_loss",
         penalty="l2",
         alpha=1e-5,
-        max_iter=50,
+        max_iter=1000,
         tol=1e-3,
         class_weight="balanced",
         n_jobs=-1,
-        random_state=SEED,
+        random_state=random_state,
     )
     model.fit(x_train, y_train)
     return model
 
 
 class TextDetector:
-    def __init__(self, mode: str, max_features: int):
+    def __init__(self, mode: str, max_features: int, random_state: int = SEED):
         self.mode = mode
         self.vectorizer = vectorizer_for(mode, max_features)
+        self.random_state = random_state
         self.model = None
 
     def fit(self, frame: pd.DataFrame, target: str = TARGET) -> "TextDetector":
         x = self.vectorizer.fit_transform(frame["text"].fillna("").astype(str))
-        self.model = fit_sgd(x, frame[target].astype(int).to_numpy())
+        self.model = fit_sgd(x, frame[target].astype(int).to_numpy(), self.random_state)
         return self
 
     def score(self, frame: pd.DataFrame) -> np.ndarray:
@@ -69,10 +70,11 @@ class TextDetector:
 
 
 class HybridDetector:
-    def __init__(self, max_features: int):
+    def __init__(self, max_features: int, random_state: int = SEED):
         self.word = vectorizer_for("word", max_features // 2)
         self.char = vectorizer_for("char", max_features // 2)
         self.scaler = MaxAbsScaler()
+        self.random_state = random_state
         self.model = None
 
     def _fit_matrix(self, frame: pd.DataFrame):
@@ -91,22 +93,27 @@ class HybridDetector:
 
     def fit(self, frame: pd.DataFrame, target: str = TARGET) -> "HybridDetector":
         x = self._fit_matrix(frame)
-        self.model = fit_sgd(x, frame[target].astype(int).to_numpy())
+        self.model = fit_sgd(x, frame[target].astype(int).to_numpy(), self.random_state)
         return self
 
     def score(self, frame: pd.DataFrame) -> np.ndarray:
         return get_scores(self.model, self._matrix(frame))
 
 
-def balanced_sample(frame: pd.DataFrame, target: str, max_rows: int) -> pd.DataFrame:
+def balanced_sample(
+    frame: pd.DataFrame,
+    target: str,
+    max_rows: int,
+    random_state: int = SEED,
+) -> pd.DataFrame:
     frame = frame.dropna(subset=["text", target]).copy()
     frame[target] = frame[target].astype(int)
     groups = [group for _, group in frame.groupby(target)]
     if len(groups) < 2:
-        return frame.sample(min(len(frame), max_rows), random_state=SEED).reset_index(drop=True)
+        return frame.sample(min(len(frame), max_rows), random_state=random_state).reset_index(drop=True)
     per_class = min(min(len(group) for group in groups), max(1, max_rows // 2))
-    sampled = [group.sample(per_class, random_state=SEED) for group in groups]
-    return pd.concat(sampled, ignore_index=True).sample(frac=1, random_state=SEED).reset_index(drop=True)
+    sampled = [group.sample(per_class, random_state=random_state) for group in groups]
+    return pd.concat(sampled, ignore_index=True).sample(frac=1, random_state=random_state).reset_index(drop=True)
 
 
 def build_external_stage_like_frame(
@@ -116,12 +123,8 @@ def build_external_stage_like_frame(
     neuralchemy_train: pd.DataFrame,
     max_rows: int,
 ) -> pd.DataFrame:
-    """Approximate stage labels from non-LLMail training datasets.
+    # here we approximate stage labels from non-LLMail training datasets
 
-    These are intentionally noisy auxiliary labels, not claimed ground truth.
-    NVIDIA is excluded because it has only a train split and is evaluated as a
-    held-out attack-only benchmark below.
-    """
     frames = []
     keep = [bipia_train, promptshield_train, shieldlm_train, neuralchemy_train]
     for frame in keep:
@@ -168,6 +171,7 @@ def fit_stage_models(
     max_rows: int,
     max_features: int,
     external_stage_like: pd.DataFrame | None = None,
+    random_state: int = SEED,
 ) -> dict[str, TextDetector]:
     models = {}
     for target in STAGE_TARGETS:
@@ -178,8 +182,10 @@ def fit_stage_models(
         if external_stage_like is not None and target in external_stage_like.columns:
             pieces.append(external_stage_like[["text", target]])
         stage_frame = pd.concat(pieces, ignore_index=True, sort=False)
-        sampled = balanced_sample(stage_frame, target, max_rows=max_rows)
-        models[target] = TextDetector("char", max_features=max_features).fit(sampled, target=target)
+        sampled = balanced_sample(stage_frame, target, max_rows=max_rows, random_state=random_state)
+        models[target] = TextDetector(
+            "char", max_features=max_features, random_state=random_state
+        ).fit(sampled, target=target)
     return models
 
 

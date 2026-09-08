@@ -43,12 +43,12 @@ SECURITY_PATTERN_GROUPS = {
         r"send.*secret",
     ],
     "target_artifacts": [
-        r"contact@contact\.com",
-        r"confirmation",
-        r"recipient",
-        r"body",
-        r"to:",
-        r"subject:",
+        r"\brecipient\s*[:=]",
+        r"\bdestination\s*[:=]",
+        r"\bbody\s*[:=]",
+        r"\bmessage\s*[:=]",
+        r"\bto\s*:\s*[A-Za-z0-9._%+-]+\s*@",
+        r"\bsubject\s*[:=]",
     ],
     "obfuscation": [
         r"base64",

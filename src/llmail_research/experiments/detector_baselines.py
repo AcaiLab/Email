@@ -1,7 +1,6 @@
 import argparse
 import json
 import time
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -20,6 +19,13 @@ from llmail_research.external_datasets import (
     load_shieldlm,
     sample_equal_classes,
 )
+from llmail_research.eval_utils import (
+    NOTINJECT_ROTATIONS,
+    build_matched_test_sets,
+    clopper_pearson_interval,
+    strict_threshold_from_benign,
+)
+from llmail_research.metrics import metrics_from_scores
 
 TARGET = "label_attack"
 
@@ -125,7 +131,112 @@ def threshold_from_benign(scores: np.ndarray, max_fpr: float) -> float:
     return float(np.quantile(scores, 1 - max_fpr, method="higher"))
 
 
-def test_sets(max_test_rows: int) -> dict[str, pd.DataFrame]:
+def evaluate(method, policy, threshold, source, frame, scores, rotation) -> dict:
+    labels = frame[TARGET].astype(int).to_numpy()
+    predictions = (scores >= threshold).astype(int)
+    row = {
+        "method": method,
+        "training_adaptation": "frozen pretrained weights; threshold calibration only",
+        "threshold_policy": policy,
+        "threshold": float(threshold),
+        "rotation": rotation.name,
+        "notinject_calibration_split": rotation.calibration_split,
+        "notinject_test_split": rotation.test_split,
+        "test_source": source,
+        "n_test": len(frame),
+        "test_positive_rate": float(labels.mean()) if len(labels) else float("nan"),
+        "predicted_positive_rate": float(predictions.mean()),
+    }
+    if len(np.unique(labels)) == 2:
+        row.update(metrics_from_scores(labels, scores, threshold, prefix="test_"))
+    elif len(labels) and labels[0] == 0:
+        row["test_false_positive_rate"] = float(predictions.mean())
+        row["test_fp"] = int(predictions.sum())
+        row["test_tn"] = int(len(labels) - predictions.sum())
+    elif len(labels):
+        row["test_false_negative_rate"] = float(1 - predictions.mean())
+        row["test_recall"] = float(predictions.mean())
+    return row
+
+
+def summarize(results: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for (method, policy, rotation), group in results.groupby(["method", "threshold_policy", "rotation"]):
+        binary = group[group["test_f1"].notna()]
+
+        def value(source, column):
+            selected = group.loc[group["test_source"].eq(source), column]
+            return float(selected.iloc[0]) if len(selected) else float("nan")
+
+        rows.append(
+            {
+                "method": method,
+                "threshold_policy": policy,
+                "rotation": rotation,
+                "mean_binary_f1": float(binary["test_f1"].mean()),
+                "mean_binary_precision": float(binary["test_precision"].mean()),
+                "mean_binary_recall": float(binary["test_recall"].mean()),
+                "notinject_fpr": value("notinject", "test_false_positive_rate"),
+                "notinject_fp": int(value("notinject", "test_fp")),
+                "notinject_n": int(value("notinject", "n_test")),
+                "nvidia_recall": value("nvidia_agentic_ipi", "test_recall"),
+                "bipia_f1": value("bipia_test", "test_f1"),
+                "llmail_f1": value("llmail_phase2_binary", "test_f1"),
+                "promptshield_f1": value("promptshield_test", "test_f1"),
+                "shieldlm_f1": value("shieldlm_test", "test_f1"),
+                "neuralchemy_f1": value("neuralchemy_core_test", "test_f1"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def aggregate(summary: pd.DataFrame) -> pd.DataFrame:
+    metrics = [
+        "mean_binary_f1",
+        "mean_binary_precision",
+        "mean_binary_recall",
+        "notinject_fpr",
+        "nvidia_recall",
+        "bipia_f1",
+        "llmail_f1",
+        "promptshield_f1",
+        "shieldlm_f1",
+        "neuralchemy_f1",
+    ]
+    rows = []
+    for (method, policy), group in summary.groupby(["method", "threshold_policy"]):
+        row = {"method": method, "threshold_policy": policy, "n_rotations": len(group)}
+        for metric in metrics:
+            row[f"{metric}_mean"] = float(group[metric].mean())
+            row[f"{metric}_std"] = float(group[metric].std(ddof=1))
+        false_positives = int(group["notinject_fp"].sum())
+        trials = int(group["notinject_n"].sum())
+        low, high = clopper_pearson_interval(false_positives, trials)
+        row["notinject_fp"] = false_positives
+        row["notinject_n"] = trials
+        row["notinject_fpr_ci95_lower"] = low
+        row["notinject_fpr_ci95_upper"] = high
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values(
+        ["threshold_policy", "mean_binary_f1_mean"], ascending=[True, False]
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run matched published-detector comparison.")
+    parser.add_argument("--max-test-rows", type=int, default=2_000)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--max-length", type=int, default=512)
+    parser.add_argument("--max-fpr", type=float, default=0.01)
+    parser.add_argument("--models", nargs="*", default=[spec["method"] for spec in MODEL_SPECS])
+    args = parser.parse_args()
+
+    start = time.time()
+    output_dir = RESULTS_DIR / "published_detectors"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = choose_device()
+    print(f"Using device: {device}", flush=True)
+
     llmail = load_llmail_binary()
     bipia = load_bipia_binary()
     notinject = load_notinject()
@@ -133,142 +244,106 @@ def test_sets(max_test_rows: int) -> dict[str, pd.DataFrame]:
     promptshield = load_promptshield()
     shieldlm = load_shieldlm()
     neuralchemy = load_neuralchemy_core()
-    heldout_notinject = notinject[notinject["split"].isin(["NotInject_two", "NotInject_three"])].reset_index(drop=True)
-    calibrate_notinject = notinject[notinject["split"].eq("NotInject_one")].reset_index(drop=True)
-    return {
-        "notinject_calibration": calibrate_notinject,
-        "bipia_test": sample_equal_classes(bipia[bipia["split"].eq("test")].reset_index(drop=True), TARGET, max_test_rows),
-        "llmail_binary": sample_equal_classes(llmail, TARGET, max_test_rows),
-        "notinject": heldout_notinject,
-        "nvidia_agentic_ipi": nvidia.reset_index(drop=True),
-        "promptshield_test": sample_equal_classes(promptshield[promptshield["split"].eq("test")].reset_index(drop=True), TARGET, max_test_rows),
-        "shieldlm_test": sample_equal_classes(shieldlm[shieldlm["split"].eq("test")].reset_index(drop=True), TARGET, max_test_rows),
-        "neuralchemy_core_test": sample_equal_classes(neuralchemy[neuralchemy["split"].eq("test")].reset_index(drop=True), TARGET, max_test_rows),
-    }
-
-
-def summarize(rows: pd.DataFrame) -> pd.DataFrame:
-    summary_rows = []
-    for (method, policy), group in rows.groupby(["method", "threshold_policy"]):
-        binary = group[group["test_f1"].notna()]
-        benign = group[group["test_source"].eq("notinject")]
-        nvidia = group[group["test_source"].eq("nvidia_agentic_ipi")]
-        summary_rows.append(
-            {
-                "method": method,
-                "threshold_policy": policy,
-                "mean_binary_f1": float(binary["test_f1"].mean()),
-                "mean_binary_recall": float(binary["test_recall"].mean()),
-                "notinject_fpr": float(benign["test_false_positive_rate"].iloc[0]) if len(benign) else np.nan,
-                "nvidia_recall": float(1 - nvidia["test_false_negative_rate"].iloc[0]) if len(nvidia) else np.nan,
-                "bipia_f1": value_for(group, "bipia_test", "test_f1"),
-                "llmail_f1": value_for(group, "llmail_binary", "test_f1"),
-                "promptshield_f1": value_for(group, "promptshield_test", "test_f1"),
-                "shieldlm_f1": value_for(group, "shieldlm_test", "test_f1"),
-                "neuralchemy_f1": value_for(group, "neuralchemy_core_test", "test_f1"),
-            }
-        )
-    return pd.DataFrame(summary_rows).sort_values(["threshold_policy", "mean_binary_f1"], ascending=[True, False])
-
-
-def value_for(group: pd.DataFrame, source: str, column: str) -> float:
-    values = group.loc[group["test_source"].eq(source), column]
-    return float(values.iloc[0]) if len(values) else np.nan
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate published prompt-injection detectors.")
-    parser.add_argument("--max-test-rows", type=int, default=20_000)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--max-length", type=int, default=512)
-    parser.add_argument("--max-fpr", type=float, default=0.01)
-    parser.add_argument("--models", nargs="*", default=[spec["method"] for spec in MODEL_SPECS])
-    args = parser.parse_args()
-
-    device = choose_device()
-    print(f"Using device: {device}")
-    sets = test_sets(args.max_test_rows)
-    selected = [spec for spec in MODEL_SPECS if spec["method"] in set(args.models)]
-    rows = []
+    common_sets = build_matched_test_sets(
+        llmail,
+        bipia,
+        notinject,
+        nvidia,
+        promptshield,
+        shieldlm,
+        neuralchemy,
+        NOTINJECT_ROTATIONS[0].test_split,
+        args.max_test_rows,
+        SEED,
+    )
+    common_sets.pop("notinject")
+    selected_specs = [spec for spec in MODEL_SPECS if spec["method"] in set(args.models)]
+    results = []
     audit = []
-    for spec in selected:
-        start = time.time()
-        print(f"Loading {spec['method']} ({spec['model_id']})")
+
+    for spec in selected_specs:
+        model_start = time.time()
+        print(f"Loading {spec['method']} ({spec['model_id']})", flush=True)
         try:
             config = AutoConfig.from_pretrained(spec["model_id"])
             tokenizer = AutoTokenizer.from_pretrained(spec["model_id"])
             model = AutoModelForSequenceClassification.from_pretrained(spec["model_id"])
             model.to(device)
-            pos_idx = positive_index(config, spec["positive_labels"])
-            calibration_scores = batched_scores(
-                model,
-                tokenizer,
-                sets["notinject_calibration"]["text"].fillna("").astype(str).tolist(),
-                pos_idx,
-                device,
-                args.batch_size,
-                args.max_length,
-            )
-            calibrated_threshold = threshold_from_benign(calibration_scores, args.max_fpr)
-            thresholds = {"default_0.50": 0.5, f"notinject_calib_{args.max_fpr:.2f}": calibrated_threshold}
-            for source, frame in sets.items():
-                if source == "notinject_calibration":
-                    continue
-                print(f"  scoring {source}: {len(frame)} rows")
-                scores = batched_scores(
+            positive_label = positive_index(config, spec["positive_labels"])
+            score_cache = {}
+            for source, frame in common_sets.items():
+                print(f"  scoring {source}: {len(frame)}", flush=True)
+                score_cache[source] = batched_scores(
                     model,
                     tokenizer,
                     frame["text"].fillna("").astype(str).tolist(),
-                    pos_idx,
+                    positive_label,
                     device,
                     args.batch_size,
                     args.max_length,
                 )
+            for split in sorted(notinject["split"].unique()):
+                frame = notinject[notinject["split"].eq(split)].reset_index(drop=True)
+                score_cache[split] = batched_scores(
+                    model,
+                    tokenizer,
+                    frame["text"].fillna("").astype(str).tolist(),
+                    positive_label,
+                    device,
+                    args.batch_size,
+                    args.max_length,
+                )
+
+            for rotation in NOTINJECT_ROTATIONS:
+                calibration_scores = score_cache[rotation.calibration_split]
+                strict_threshold, _, _ = strict_threshold_from_benign(calibration_scores, args.max_fpr)
+                thresholds = {"default_0.50": 0.5, f"notinject_fpr_{args.max_fpr:.2f}": strict_threshold}
                 for policy, threshold in thresholds.items():
-                    row = {
-                        "method": spec["method"],
-                        "model_id": spec["model_id"],
-                        "threshold_policy": policy,
-                        "test_source": source,
-                        "n_test": len(frame),
-                        "test_positive_rate": float(frame[TARGET].mean()),
-                        "predicted_positive_rate": float((scores >= threshold).mean()),
-                    }
-                    if frame[TARGET].nunique() == 2:
-                        metrics = metrics_binary(frame[TARGET], scores, threshold)
-                        row.update({f"test_{key}": value for key, value in metrics.items()})
-                    else:
-                        label = int(frame[TARGET].iloc[0]) if len(frame) else 0
-                        if label == 0:
-                            row["test_false_positive_rate"] = float((scores >= threshold).mean())
-                        else:
-                            row["test_false_negative_rate"] = float((scores < threshold).mean())
-                            row["test_recall"] = float((scores >= threshold).mean())
-                    rows.append(row)
-            audit.append({**spec, "status": "ok", "seconds": round(time.time() - start, 1), "positive_index": pos_idx, "labels": config.id2label})
+                    for source, frame in common_sets.items():
+                        results.append(
+                            evaluate(spec["method"], policy, threshold, source, frame, score_cache[source], rotation)
+                        )
+                    ni_test = notinject[notinject["split"].eq(rotation.test_split)].reset_index(drop=True)
+                    results.append(
+                        evaluate(
+                            spec["method"],
+                            policy,
+                            threshold,
+                            "notinject",
+                            ni_test,
+                            score_cache[rotation.test_split],
+                            rotation,
+                        )
+                    )
+            audit.append(
+                {
+                    **spec,
+                    "status": "ok",
+                    "seconds": round(time.time() - model_start, 1),
+                    "positive_index": positive_label,
+                    "labels": config.id2label,
+                }
+            )
             del model
             if device.type == "mps":
                 torch.mps.empty_cache()
         except Exception as exc:
             audit.append({**spec, "status": "failed", "error": repr(exc)})
-            print(f"FAILED {spec['method']}: {exc}")
+            print(f"FAILED {spec['method']}: {exc}", flush=True)
 
     for spec in INACCESSIBLE_MODEL_SPECS:
         audit.append({**spec, "status": "not_run", "error": spec["reason"]})
 
-    results = pd.DataFrame(rows)
-    output = RESULTS_DIR / "published_detectors" / "published_detector_results.csv"
-    summary_output = RESULTS_DIR / "published_detectors" / "published_detector_summary.csv"
-    audit_output = RESULTS_DIR / "published_detectors" / "published_detector_audit.json"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    results.to_csv(output, index=False)
-    summary = summarize(results) if len(results) else pd.DataFrame()
-    summary.to_csv(summary_output, index=False)
-    audit_output.write_text(json.dumps(audit, indent=2, default=str), encoding="utf-8")
-    print(summary.to_string(index=False))
-    print(f"Saved: {output}")
-    print(f"Saved: {summary_output}")
-    print(f"Saved: {audit_output}")
+    detailed = pd.DataFrame(results)
+    per_rotation = summarize(detailed) if len(detailed) else pd.DataFrame()
+    summary = aggregate(per_rotation) if len(per_rotation) else pd.DataFrame()
+    detailed.to_csv(output_dir / "published_detector_results.csv", index=False)
+    per_rotation.to_csv(output_dir / "published_detector_rotation_summary.csv", index=False)
+    summary.to_csv(output_dir / "published_detector_summary.csv", index=False)
+    (output_dir / "published_detector_audit.json").write_text(json.dumps(audit, indent=2, default=str), encoding="utf-8")
+    print(summary.to_string(index=False), flush=True)
+    print(f"Saved matched published-detector results to {output_dir}", flush=True)
+    print(f"Finished in {(time.time() - start) / 60:.1f} minutes", flush=True)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
-from llmail_research.pipeline import run_experiment  # noqa: E402
+from llmail_research.pipeline import run_experiment
 
 
 DEFAULT_MODELS = [
@@ -17,8 +17,8 @@ DEFAULT_MODELS = [
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run published-detector baselines.")
-    parser.add_argument("--quick", action="store_true", help="Use fewer test rows for a smoke run.")
+    parser = argparse.ArgumentParser(description="Run published detector baselines.")
+    parser.add_argument("--quick", action="store_true", help="Run fewer test rows.")
     parser.add_argument("--max-test-rows", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-length", type=int, default=512)
